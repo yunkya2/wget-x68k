@@ -79,8 +79,12 @@ linux unix:
 	$(MAKE) CROSS_COMPILE= LIBS= DEFS=-UCONFIG_M68K_ASM
 
 clean:
-	-rm -f $(OBJS) $(DEPS) $(TARGET) $(TARGET).elf
+	-rm -f $(OBJS) $(DEPS) $(TARGET) $(TARGET).elf README.txt
+
+release: clean all
+	./md2txtconv.py README.md
+	zip wget-$(GIT_REPO_VERSION).zip README.txt wget.x
 
 -include $(DEPS)
 
-.PHONY: all clean linux unix
+.PHONY: all clean linux unix release
