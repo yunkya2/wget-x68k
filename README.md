@@ -90,7 +90,7 @@ wget ftp://user:pass@example.com/file.bin
 [elf2x68k](https://github.com/yunkya2/elf2x68k) の 20250907 版以降が必要です。
 
 ```
-git clone --recursive https://github.com/yunkya2/wget.git
+git clone --recursive https://github.com/yunkya2/wget-x68k.git
 ```
 で、サブモジュール込みで clone した後、以下のコマンドでビルドします。
 
