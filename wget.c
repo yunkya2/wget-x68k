@@ -1457,6 +1457,34 @@ static int ftp_download(const Url *url, const char *out_path, const char *out_di
 //****************************************************************************
 
 /**
+ * write_body_bytes - Write downloaded bytes and refresh progress display
+ * @out_fd: output file descriptor
+ * @buf: byte buffer to write
+ * @n: number of bytes to write
+ * @downloaded: pointer to total downloaded bytes
+ * @total: expected total bytes, or -1 if unknown
+ * @quiet: if true, suppress output
+ * @start_time: download start time
+ * @initial_downloaded: bytes already downloaded before this session
+ * @last: pointer to last progress update timestamp
+ * @out_file: output filename (for progress display)
+ */
+static void write_body_bytes(int out_fd, const char *buf, size_t n,
+                             long *downloaded, long total, bool quiet,
+                             time_t start_time, long initial_downloaded,
+                             time_t *last, const char *out_file)
+{
+    write_all_or_die(out_fd, buf, n);
+    *downloaded += (long)n;
+
+    time_t now = time(NULL);
+    if (now != *last) {
+        print_progress(out_file, *downloaded, total, quiet, start_time, initial_downloaded);
+        *last = now;
+    }
+}
+
+/**
  * download_body - Download HTTP response body
  * @c: connection
  * @meta: parsed HTTP metadata
@@ -1479,6 +1507,7 @@ static void download_body(Conn *c, const HttpMeta *meta, const char *hdrs, size_
     long total = (meta->content_length > 0) ? (meta->content_length + initial_downloaded) : -1;
     time_t last = 0;
     time_t start_time = time(NULL);
+    char buf[BUF_SIZE];
     if (!quiet && total > 0 && downloaded == 0) {
         print_progress(out_file, 0, total, quiet, start_time, initial_downloaded);
     }
@@ -1494,20 +1523,15 @@ static void download_body(Conn *c, const HttpMeta *meta, const char *hdrs, size_
                 break;
             }
             long remaining = chunk;
-            char buf[BUF_SIZE];
             while (remaining > 0) {
                 size_t to_read = (remaining > (long)sizeof(buf)) ? sizeof(buf) : (size_t)remaining;
                 ssize_t n = conn_read(c, buf, to_read);
                 if (n <= 0) break;
-                write_all_or_die(out_fd, buf, (size_t)n);
+                write_body_bytes(out_fd, buf, (size_t)n,
+                                 &downloaded, total, quiet,
+                                 start_time, initial_downloaded,
+                                 &last, out_file);
                 remaining -= n;
-                downloaded += n;
-
-                time_t now = time(NULL);
-                if (now != last) {
-                    print_progress(out_file, downloaded, total, quiet, start_time, initial_downloaded);
-                    last = now;
-                }
             }
             read_line(c, line, sizeof(line));
         }
@@ -1515,17 +1539,13 @@ static void download_body(Conn *c, const HttpMeta *meta, const char *hdrs, size_
         return;
     }
 
-    char buf[BUF_SIZE];
     while (true) {
         ssize_t n = conn_read(c, buf, sizeof(buf));
         if (n <= 0) break;
-        write_all_or_die(out_fd, buf, (size_t)n);
-        downloaded += n;
-        time_t now = time(NULL);
-        if (now != last) {
-            print_progress(out_file, downloaded, total, quiet, start_time, initial_downloaded);
-            last = now;
-        }
+        write_body_bytes(out_fd, buf, (size_t)n,
+                         &downloaded, total, quiet,
+                         start_time, initial_downloaded,
+                         &last, out_file);
         if (total > 0 && downloaded >= total) break;
     }
     if (total > 0 && downloaded < total) {
