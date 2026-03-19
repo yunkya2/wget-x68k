@@ -44,6 +44,7 @@
 #else
 typedef void *SSL_CTX;
 #endif
+#include "iconv_mini.h"
 
 //****************************************************************************
 // Macros and definitions
@@ -85,6 +86,12 @@ typedef struct {
     char location[MAX_URL_LEN];
     char content_type[128];
 } HttpMeta;
+
+typedef struct {
+    bool enabled;
+    char pending[4];
+    size_t pending_len;
+} TextConvState;
 
 //****************************************************************************
 // Utility functions
@@ -1130,6 +1137,150 @@ static void print_saved_summary(const char *out_file, long downloaded, bool quie
             ts, speed_buf, out_file, downloaded, downloaded);
 }
 
+/**
+ * textconv_init - Initialize text conversion state
+ * @state: conversion state object
+ * @enabled: true to enable UTF-8 -> Shift_JIS conversion
+ */
+static void textconv_init(TextConvState *state, bool enabled)
+{
+    state->enabled = enabled;
+    state->pending_len = 0;
+}
+
+/**
+ * textconv_write - Convert UTF-8 bytes to Shift_JIS and write
+ * @out_fd: output file descriptor
+ * @data: source bytes
+ * @len: source byte count
+ * @state: conversion state (pending UTF-8 bytes between chunks)
+ *
+ * If conversion fails for a byte sequence, it falls back to passthrough
+ * byte-by-byte so download does not abort on malformed input.
+ */
+static void textconv_write(int out_fd, const char *data, size_t len, TextConvState *state)
+{
+    if (!state || !state->enabled) {
+        write_all_or_die(out_fd, data, len);
+        return;
+    }
+
+    if (len == 0) {
+        return;
+    }
+
+    char src_buf[BUF_SIZE + 8];
+    char dst_buf[(BUF_SIZE + 8) * 2];
+    size_t src_len = state->pending_len + len;
+    if (src_len > sizeof(src_buf)) {
+        die("conversion source buffer overflow");
+    }
+
+    memcpy(src_buf, state->pending, state->pending_len);
+    memcpy(src_buf + state->pending_len, data, len);
+    state->pending_len = 0;
+
+    char *src_ptr = src_buf;
+    size_t src_left = src_len;
+    char *dst_ptr = dst_buf;
+    size_t dst_left = sizeof(dst_buf);
+
+    while (src_left > 0) {
+        char *in_ptr = src_ptr;
+        size_t in_left = src_left;
+        char *out_ptr = dst_ptr;
+        size_t out_left = dst_left;
+        int rc = iconv_u2s(&in_ptr, &in_left, &out_ptr, &out_left);
+
+        size_t consumed = (size_t)(in_ptr - src_ptr);
+        src_ptr = in_ptr;
+        src_left = in_left;
+        dst_ptr = out_ptr;
+        dst_left = out_left;
+
+        if (rc == 0) {
+            break;
+        }
+
+        if (consumed > 0) {
+            continue;
+        }
+
+        if (src_left <= 2) {
+            memcpy(state->pending, src_ptr, src_left);
+            state->pending_len = src_left;
+            src_left = 0;
+            break;
+        }
+
+        if (dst_left == 0) {
+            die("conversion destination buffer overflow");
+        }
+        *dst_ptr++ = *src_ptr++;
+        dst_left--;
+        src_left--;
+    }
+
+    size_t produced = (size_t)(dst_ptr - dst_buf);
+    if (produced > 0) {
+        write_all_or_die(out_fd, dst_buf, produced);
+    }
+}
+
+/**
+ * textconv_flush - Flush pending bytes in conversion state
+ * @out_fd: output file descriptor
+ * @state: conversion state
+ */
+static void textconv_flush(int out_fd, TextConvState *state)
+{
+    if (!state || !state->enabled || state->pending_len == 0) {
+        return;
+    }
+
+    char *src_ptr = state->pending;
+    size_t src_left = state->pending_len;
+    char dst_buf[16];
+    char *dst_ptr = dst_buf;
+    size_t dst_left = sizeof(dst_buf);
+
+    while (src_left > 0) {
+        char *in_ptr = src_ptr;
+        size_t in_left = src_left;
+        char *out_ptr = dst_ptr;
+        size_t out_left = dst_left;
+        int rc = iconv_u2s(&in_ptr, &in_left, &out_ptr, &out_left);
+
+        size_t consumed = (size_t)(in_ptr - src_ptr);
+        src_ptr = in_ptr;
+        src_left = in_left;
+        dst_ptr = out_ptr;
+        dst_left = out_left;
+
+        if (rc == 0) {
+            break;
+        }
+
+        if (consumed > 0) {
+            continue;
+        }
+
+        if (dst_left == 0) {
+            break;
+        }
+        *dst_ptr++ = *src_ptr++;
+        dst_left--;
+        src_left--;
+    }
+
+    size_t produced = (size_t)(dst_ptr - dst_buf);
+    if (produced > 0) {
+        write_all_or_die(out_fd, dst_buf, produced);
+    }
+
+    state->pending_len = 0;
+}
+
 //****************************************************************************
 // FTP protocol functions
 //****************************************************************************
@@ -1314,7 +1465,7 @@ static int ftp_open_pasv_data(const Url *url, int ctrl_fd, bool quiet)
  * Return: 0 on success
  */
 static int ftp_download(const Url *url, const char *out_path, const char *out_dir,
-                        bool quiet, bool continue_mode)
+                        bool quiet, bool continue_mode, bool convert_u2s)
 {
     char out_file[1024];
     pick_output_name(url, out_path, out_dir, out_file, sizeof(out_file));
@@ -1408,6 +1559,8 @@ static int ftp_download(const Url *url, const char *out_path, const char *out_di
     long initial_downloaded = downloaded;
     time_t last = 0;
     time_t start_time = time(NULL);
+    TextConvState conv_state;
+    textconv_init(&conv_state, convert_u2s);
     if (!quiet && total > 0 && downloaded == 0) {
         print_progress(out_file, 0, total, quiet, start_time, initial_downloaded);
     }
@@ -1421,7 +1574,7 @@ static int ftp_download(const Url *url, const char *out_path, const char *out_di
             die("FTP data read failed: %s", strerror(errno));
         }
         if (n == 0) break;
-        write_all_or_die(out_fd, buf, (size_t)n);
+        textconv_write(out_fd, buf, (size_t)n, &conv_state);
         downloaded += n;
         time_t now = time(NULL);
         if (now != last) {
@@ -1429,6 +1582,7 @@ static int ftp_download(const Url *url, const char *out_path, const char *out_di
             last = now;
         }
     }
+    textconv_flush(out_fd, &conv_state);
     if (total > 0 && downloaded < total) {
         downloaded = total;
     }
@@ -1472,9 +1626,10 @@ static int ftp_download(const Url *url, const char *out_path, const char *out_di
 static void write_body_bytes(int out_fd, const char *buf, size_t n,
                              long *downloaded, long total, bool quiet,
                              time_t start_time, long initial_downloaded,
-                             time_t *last, const char *out_file)
+                             time_t *last, const char *out_file,
+                             TextConvState *conv_state)
 {
-    write_all_or_die(out_fd, buf, n);
+    textconv_write(out_fd, buf, n, conv_state);
     *downloaded += (long)n;
 
     time_t now = time(NULL);
@@ -1499,7 +1654,7 @@ static void write_body_bytes(int out_fd, const char *buf, size_t n,
  */
 static void download_body(Conn *c, const HttpMeta *meta, const char *hdrs, size_t hdr_len,
                           int out_fd, bool quiet, long initial_downloaded,
-                          const char *out_file)
+                          const char *out_file, bool convert_u2s)
 {
     (void)hdrs;
     (void)hdr_len;
@@ -1508,6 +1663,8 @@ static void download_body(Conn *c, const HttpMeta *meta, const char *hdrs, size_
     time_t last = 0;
     time_t start_time = time(NULL);
     char buf[BUF_SIZE];
+    TextConvState conv_state;
+    textconv_init(&conv_state, convert_u2s);
     if (!quiet && total > 0 && downloaded == 0) {
         print_progress(out_file, 0, total, quiet, start_time, initial_downloaded);
     }
@@ -1530,11 +1687,12 @@ static void download_body(Conn *c, const HttpMeta *meta, const char *hdrs, size_
                 write_body_bytes(out_fd, buf, (size_t)n,
                                  &downloaded, total, quiet,
                                  start_time, initial_downloaded,
-                                 &last, out_file);
+                                 &last, out_file, &conv_state);
                 remaining -= n;
             }
             read_line(c, line, sizeof(line));
         }
+        textconv_flush(out_fd, &conv_state);
         if (!quiet) fprintf(stderr, "\n");
         return;
     }
@@ -1545,9 +1703,10 @@ static void download_body(Conn *c, const HttpMeta *meta, const char *hdrs, size_
         write_body_bytes(out_fd, buf, (size_t)n,
                          &downloaded, total, quiet,
                          start_time, initial_downloaded,
-                         &last, out_file);
+                         &last, out_file, &conv_state);
         if (total > 0 && downloaded >= total) break;
     }
+    textconv_flush(out_fd, &conv_state);
     if (total > 0 && downloaded < total) {
         downloaded = total;
     }
@@ -1606,6 +1765,7 @@ static void usage(const char *argv0)
             "  -P DIR    Save output in DIR\n"
             "  -q        Quiet (no progress)\n"
             "  -c        Continue/resume partially downloaded file\n"
+            "  -U        Convert UTF-8 response to Shift_JIS while saving\n"
             "  -t N      Max redirects (default 5)\n",
             argv0);
 }
@@ -1624,15 +1784,17 @@ int main(int argc, char **argv)
     const char *out_dir = NULL;
     bool quiet = false;
     bool continue_mode = false;
+    bool convert_u2s = false;
     int max_redirects = 5;
 
     int opt;
-    while ((opt = getopt(argc, argv, "O:P:qct:")) != -1) {
+    while ((opt = getopt(argc, argv, "O:P:qcUt:")) != -1) {
         switch (opt) {
             case 'O': out_path = optarg; break;
             case 'P': out_dir = optarg; break;
             case 'q': quiet = true; break;
             case 'c': continue_mode = true; break;
+            case 'U': convert_u2s = true; break;
             case 't': max_redirects = atoi(optarg); break;
             default:
                 usage(argv[0]);
@@ -1652,7 +1814,7 @@ int main(int argc, char **argv)
     }
 
     if (strcmp(url.scheme, "ftp") == 0) {
-        return ftp_download(&url, out_path, out_dir, quiet, continue_mode);
+        return ftp_download(&url, out_path, out_dir, quiet, continue_mode, convert_u2s);
     }
 
     ssl_init_once();
@@ -1766,7 +1928,8 @@ int main(int argc, char **argv)
 
         print_length_line(&meta, quiet);
         if (!quiet) fprintf(stderr, "Saving to: '%s'\n\n", out_file);
-        download_body(&c, &meta, hdrs, hdr_len, out_fd, quiet, initial_downloaded, out_file);
+        download_body(&c, &meta, hdrs, hdr_len, out_fd, quiet, initial_downloaded,
+                  out_file, convert_u2s);
 
         close(out_fd);
         free(hdrs);
