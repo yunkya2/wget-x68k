@@ -66,6 +66,10 @@ SRCS += $(addprefix $(AXTLS_DIR)/, \
 	crypto/sha256.c \
 )
 
+INC += -Iiconv_mini
+SRCS += iconv_mini/iconv_mini.c
+DEFS += -DICONV_ONLY_U2S
+
 OBJS = $(SRCS:.c=.o)
 DEPS = $(SRCS:.c=.d)
 
