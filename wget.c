@@ -50,6 +50,10 @@ typedef void *SSL_CTX;
 // Macros and definitions
 //****************************************************************************
 
+#ifndef SOCK_STREAM_TLS
+#define SOCK_STREAM_TLS     (SOCK_STREAM + 8)
+#endif
+
 #define BUF_SIZE        16384
 #define MAX_URL_LEN     8192
 
@@ -248,11 +252,12 @@ static void addr_to_ip(const struct addrinfo *ai, char *buf, size_t buf_len)
  * @host: hostname or IP address
  * @port: TCP port number
  * @quiet: if true, suppress output
+ * @use_ssl: input: if true, try TLS socket first; output: set to false if TLS socket is available
  *
  * Resolves hostname and establishes TCP connection.
  * Return: file descriptor on success, exits on failure
  */
-static int open_tcp_connection(const char *host, int port, bool quiet)
+static int open_tcp_connection(const char *host, int port, bool quiet, bool *use_ssl)
 {
     struct addrinfo hints;
     struct addrinfo *res = NULL;
@@ -294,7 +299,15 @@ static int open_tcp_connection(const char *host, int port, bool quiet)
                 fprintf(stderr, "Connecting to %s:%d... ", host, port);
             }
         }
-        fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if (use_ssl && *use_ssl) {
+            fd = socket(p->ai_family, SOCK_STREAM_TLS, p->ai_protocol);
+            if (fd >= 0) {
+                *use_ssl = false;
+            }
+        }
+        if (fd < 0) {
+            fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        }
         if (fd < 0) {
             if (!quiet) fprintf(stderr, "failed\n");
             continue;
@@ -569,10 +582,11 @@ static Conn conn_open(const Url *u,
 {
     Conn c;
     memset(&c, 0, sizeof(c));
-    int fd = open_tcp_connection(u->host, u->port, quiet);
+    bool use_ssl = (strcmp(u->scheme, "https") == 0);
+    int fd = open_tcp_connection(u->host, u->port, quiet, &use_ssl);
 
     c.fd = fd;
-    c.use_ssl = (strcmp(u->scheme, "https") == 0);
+    c.use_ssl = use_ssl;
     if (c.use_ssl) {
 #if defined(USE_SSL) && USE_SSL
         if (!ssl_ctx) die("SSL context not initialized");
@@ -1450,7 +1464,7 @@ static int ftp_open_pasv_data(const Url *url, int ctrl_fd, bool quiet)
     snprintf(host, sizeof(host), "%d.%d.%d.%d", h1, h2, h3, h4);
     int port = p1 * 256 + p2;
     (void)url;
-    return open_tcp_connection(host, port, quiet);
+    return open_tcp_connection(host, port, quiet, NULL);
 }
 
 /**
@@ -1475,7 +1489,7 @@ static int ftp_download(const Url *url, const char *out_path, const char *out_di
         resume_from = get_existing_file_size(out_file);
     }
 
-    int ctrl_fd = open_tcp_connection(url->host, url->port, quiet);
+    int ctrl_fd = open_tcp_connection(url->host, url->port, quiet, NULL);
     char msg[1024];
 
     int code = ftp_read_response(ctrl_fd, msg, sizeof(msg));
